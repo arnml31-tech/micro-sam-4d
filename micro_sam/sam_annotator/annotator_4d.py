@@ -13,7 +13,31 @@ from .util import _load_amg_state, _load_is_state
 from . import util as _vutil
 from micro_sam.multi_dimensional_segmentation import automatic_3d_segmentation
 from skimage.transform import resize as _sk_resize
+class TimestepToolsWidget(QtWidgets.QWidget):
+    """Simple UI widget providing 4D timestep operations for manual workflows."""
+    def __init__(self, annotator, parent=None):
+        super().__init__(parent)
+        self._annotator = annotator
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
 
+        btn_segment = QtWidgets.QPushButton("Segment All Timesteps")
+        btn_commit = QtWidgets.QPushButton("Commit All Timesteps")
+
+        btn_segment.clicked.connect(lambda: self._safe_call(self._annotator.segment_all_timesteps))
+        btn_commit.clicked.connect(lambda: self._safe_call(self._annotator.commit_all_timesteps))
+
+        layout.addWidget(btn_segment)
+        layout.addWidget(btn_commit)
+
+    def _safe_call(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            try:
+                show_info(f"Operation failed: {e}")
+            except Exception:
+                print(f"Operation failed: {e}")
 
 def _select_array_from_zarr_group(f):
     """Pick a zarr.Array-like child from a zarr.Group.
@@ -572,6 +596,12 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             pass
 
+        # Add the small 4D timestep tools widget (segment/commit across T)
+        try:
+            self._annotator_widget.layout().addWidget(TimestepToolsWidget(self))
+        except Exception:
+            pass
+
         try:
             if "current_object_4d" in self._viewer.layers:
                 self._viewer.layers["current_object_4d"].data = self.current_object_4d
@@ -686,7 +716,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         # refresh points layer to the new timestep (in-place)
         try:
             pts_new = self.point_prompts[new_t]
-            lay = self._viewer.layers.get("point_prompts", None)
+            lay = self._viewer.layers["point_prompts"] if "point_prompts" in self._viewer.layers else None
             if lay is not None:
                 lay.data = np.array(pts_new) if pts_new is not None else np.empty((0, 3))
         except Exception:
@@ -720,14 +750,14 @@ class MicroSAM4DAnnotator(Annotator3d):
             return
 
         try:
-            layer = self._viewer.layers.get("committed_objects_4d", None)
+            layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
             if layer is None:
                 # ensure our 4D container exists
                 if self.segmentation_4d is None and self.image_4d is not None:
                     self.segmentation_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
                     try:
                         self._viewer.add_labels(data=self.segmentation_4d, name="committed_objects_4d")
-                        layer = self._viewer.layers.get("committed_objects_4d")
+                        layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
                     except Exception:
                         layer = None
 
@@ -864,7 +894,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             pass
         # Update the state's image_name so widgets reflect the selection
         try:
-            state.image_name = getattr(self._viewer.layers.get("raw_4d"), "name", state.image_name)
+            state.image_name = (self._viewer.layers["raw_4d"].name if "raw_4d" in self._viewer.layers else state.image_name)
         except Exception:
             pass
         # Ensure AnnotatorState has image_shape / image_scale set so downstream
@@ -876,7 +906,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             pass
         try:
-            layer = self._viewer.layers.get("raw_4d", None)
+            layer = self._viewer.layers["raw_4d"] if "raw_4d" in self._viewer.layers else None
             if layer is not None:
                 # Napari image layer scale for raw_4d is (T, Z, Y, X). Use the spatial part.
                 scale = getattr(layer, "scale", None)
@@ -1632,7 +1662,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         # Write back into the 4D auto segmentation container and refresh layer in-place
         try:
             self.auto_segmentation_4d[int(t)] = seg
-            layer = self._viewer.layers.get("auto_segmentation_4d", None)
+            layer = self._viewer.layers["auto_segmentation_4d"] if "auto_segmentation_4d" in self._viewer.layers else None
             if layer is not None:
                 layer.data[int(t)] = seg
                 try:
@@ -1691,7 +1721,7 @@ class MicroSAM4DAnnotator(Annotator3d):
 
         # Update the view
         try:
-            layer = self._viewer.layers.get("committed_objects_4d")
+            layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
             if layer is not None:
                 layer.data = self.segmentation_4d
                 try:
@@ -1855,7 +1885,7 @@ class MicroSAM4DAnnotator(Annotator3d):
                             mask = self.segmentation_4d[t] == orig
                             if np.any(mask):
                                 self.segmentation_4d[t][mask] = target
-                                layer = self._viewer.layers.get("committed_objects_4d")
+                                layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
                                 if layer is not None:
                                     layer.data = self.segmentation_4d
                                     try:
@@ -1949,7 +1979,7 @@ class MicroSAM4DAnnotator(Annotator3d):
             except Exception:
                 return
 
-            layer = self._viewer.layers.get("committed_objects_4d", None)
+            layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
             if layer is None:
                 return
 
@@ -2021,5 +2051,233 @@ class MicroSAM4DAnnotator(Annotator3d):
                         pass
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    def segment_all_timesteps(self):
+        """Run manual segmentation for all timesteps that have point prompts.
+
+        Reuses the same routine as the manual single-timestep/volume segmentation and writes
+        each result into `self.current_object_4d[t]` (T, Z, Y, X).
+        """
+        if self.image_4d is None or self.n_timesteps is None:
+            return
+
+        # Ensure container and 4D layer exist
+        if self.current_object_4d is None:
+            self.current_object_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+            try:
+                if "current_object_4d" in self._viewer.layers:
+                    self._viewer.layers["current_object_4d"].data = self.current_object_4d
+                else:
+                    self._viewer.add_labels(self.current_object_4d, name="current_object_4d")
+            except Exception:
+                pass
+
+        # Mapping of per-timestep prompts
+        prompt_map = getattr(self, "point_prompts_4d", None) or {}
+
+        # Access volumetric segmentation widget if available
+        try:
+            state = AnnotatorState()
+            seg_widget = state.widgets.get("segment_nd") if getattr(state, "widgets", None) else None
+        except Exception:
+            seg_widget = None
+
+        for t in range(int(self.n_timesteps)):
+            pts = prompt_map.get(t, np.empty((0, 3)))
+            pts_arr = np.asarray(pts) if pts is not None else np.empty((0, 3))
+            if pts_arr.size == 0:
+                continue
+
+            # Activate embeddings/predictor for this timestep
+            try:
+                if getattr(self, "timestep_embedding_manager", None) is not None:
+                    try:
+                        self.timestep_embedding_manager.on_timestep_changed(int(t))
+                    except Exception:
+                        pass
+                self._ensure_embeddings_active_for_t(int(t))
+            except Exception:
+                pass
+
+            # Show timestep t and its prompts
+            try:
+                self._load_timestep(int(t))
+            except Exception:
+                pass
+            try:
+                if "point_prompts" in self._viewer.layers:
+                    self._viewer.layers["point_prompts"].data = pts_arr
+                else:
+                    self._viewer.add_points(pts_arr, name="point_prompts")
+            except Exception:
+                pass
+
+            # Run manual volumetric segmentation
+            try:
+                if hasattr(self, "segment_current_timestep"):
+                    self.segment_current_timestep()
+                elif hasattr(self, "segment_slices"):
+                    self.segment_slices()
+                elif seg_widget is not None:
+                    seg_widget.__call__()
+                else:
+                    from micro_sam.sam_annotator import _widgets as _w
+                    _w.segment_slice(self._viewer)
+            except Exception:
+                # Skip this timestep on failure
+                continue
+
+            # Store the 3D result into current_object_4d[t]
+            vol3d = None
+            try:
+                if "current_object_4d" in self._viewer.layers:
+                    vol3d = np.asarray(self._viewer.layers["current_object_4d"].data[int(t)])
+                elif "current_object" in self._viewer.layers:
+                    vol3d = np.asarray(self._viewer.layers["current_object"].data)
+            except Exception:
+                vol3d = None
+
+            if vol3d is None:
+                continue
+
+            # Ensure correct dtype/shape
+            try:
+                target_shape = self.current_object_4d[int(t)].shape
+                if getattr(vol3d, "shape", None) != target_shape:
+                    vol3d = _sk_resize(
+                        vol3d.astype("float32"), target_shape, order=0, preserve_range=True, anti_aliasing=False
+                    ).astype(np.uint32)
+                else:
+                    vol3d = vol3d.astype(np.uint32, copy=False)
+            except Exception:
+                pass
+
+            try:
+                self.current_object_4d[int(t)] = vol3d
+                lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
+                if lay is not None:
+                    if hasattr(lay, "events") and hasattr(lay.events, "data"):
+                        with lay.events.data.blocker():
+                            lay.data[int(t)] = vol3d
+                    else:
+                        lay.data[int(t)] = vol3d
+                    try:
+                        lay.refresh()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            show_info("Finished segmenting all timesteps with point prompts.")
+        except Exception:
+            pass
+
+    def commit_all_timesteps(self):
+        """Transfer all non-empty `current_object_4d[t]` into `committed_objects_4d` using one new global ID."""
+        layer = self._viewer.layers["committed_objects_4d"] if "committed_objects_4d" in self._viewer.layers else None
+        if layer is None:
+            if self.segmentation_4d is None and self.image_4d is not None:
+                self.segmentation_4d = np.zeros_like(self.image_4d, dtype=np.uint32)
+            try:
+                layer = self._viewer.add_labels(self.segmentation_4d, name="committed_objects_4d")
+            except Exception:
+                return
+
+        # Sync local reference
+        try:
+            self.segmentation_4d = layer.data
+        except Exception:
+            pass
+
+        # Global max across all timesteps for uniqueness
+        try:
+            global_max = int(self.segmentation_4d.max()) if self.segmentation_4d is not None else 0
+        except Exception:
+            global_max = 0
+        new_id = int(global_max) + 1
+
+        for t in range(int(self.n_timesteps)):
+            if self.current_object_4d is None:
+                break
+            try:
+                seg_t = np.asarray(self.current_object_4d[int(t)])
+            except Exception:
+                seg_t = None
+            if seg_t is None or seg_t.size == 0 or not np.any(seg_t != 0):
+                continue
+
+            mask = seg_t != 0
+            try:
+                if hasattr(layer, "events") and hasattr(layer.events, "data"):
+                    with layer.events.data.blocker():
+                        layer.data[int(t)][mask] = new_id
+                else:
+                    layer.data[int(t)][mask] = new_id
+            except Exception:
+                try:
+                    arr = np.asarray(layer.data[int(t)])
+                    arr[mask] = new_id
+                    layer.data[int(t)] = arr
+                except Exception:
+                    pass
+
+            # Update local cache
+            try:
+                self.segmentation_4d = layer.data
+                if self._segmentation_cache is None:
+                    self._segmentation_cache = [None] * self.n_timesteps
+                self._segmentation_cache[int(t)] = np.asarray(layer.data[int(t)]).copy()
+            except Exception:
+                pass
+
+        try:
+            layer.refresh()
+        except Exception:
+            pass
+
+        # Cleanup: clear all point prompts and current object masks after committing
+        # Clear stored per-timestep prompts
+        try:
+            self.point_prompts = {}
+        except Exception:
+            pass
+        # Clear napari points layer
+        try:
+            if "point_prompts" in self._viewer.layers:
+                self._viewer.layers["point_prompts"].data = np.empty((0, 3))
+        except Exception:
+            pass
+
+        # Clear the 4D current object layer content
+        try:
+            if self.current_object_4d is not None:
+                self.current_object_4d[...] = 0
+            if "current_object_4d" in self._viewer.layers:
+                lay_cur = self._viewer.layers["current_object_4d"]
+                if hasattr(lay_cur, "events") and hasattr(lay_cur.events, "data"):
+                    with lay_cur.events.data.blocker():
+                        lay_cur.data = self.current_object_4d
+                else:
+                    lay_cur.data = self.current_object_4d
+                try:
+                    lay_cur.refresh()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Optional: also clear 3D current_object layer if present
+        try:
+            if "current_object" in self._viewer.layers:
+                co3d = self._viewer.layers["current_object"].data
+                zeros3d = np.zeros_like(co3d, dtype=np.uint32)
+                self._viewer.layers["current_object"].data = zeros3d
+                try:
+                    self._viewer.layers["current_object"].refresh()
+                except Exception:
+                    pass
         except Exception:
             pass
