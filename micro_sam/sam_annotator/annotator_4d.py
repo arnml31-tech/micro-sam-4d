@@ -3,6 +3,7 @@ import threading
 from qtpy import QtWidgets
 from qtpy.QtGui import QKeySequence, QCursor
 from qtpy.QtCore import Qt, QPoint
+from qtpy.QtWidgets import QFileDialog
 from napari.utils.notifications import show_info
 from micro_sam.sam_annotator.annotator_3d import Annotator3d
 from micro_sam.sam_annotator._state import AnnotatorState
@@ -211,10 +212,6 @@ class TimestepEmbeddingManager:
             # Materialize (open) the zarr in background thread context (we're already in a thread)
             try:
                 import zarr as _zarr
-                try:
-                    show_info(f"Loading embeddings for timestep {t} from {zpath}...")
-                except Exception:
-                    pass
                 f = _zarr.open(str(zpath), mode="r")
                 # Pick a suitable array-like dataset from the zarr group.
                 feats = _select_array_from_zarr_group(f)
@@ -254,10 +251,6 @@ class TimestepEmbeddingManager:
                 try:
                     # call annotator activation so AnnotatorState binds this embedding
                     self.annotator._ensure_embeddings_active_for_t(int(t))
-                except Exception:
-                    pass
-                try:
-                    show_info(f"Embeddings for timestep {t} loaded.")
                 except Exception:
                     pass
                 return entry
@@ -338,6 +331,8 @@ class MicroSAM4DAnnotator(Annotator3d):
         self._embedding_loading = {}
         # currently-active timestep whose embeddings are bound to AnnotatorState
         self._active_embedding_t = None
+        # track which timesteps we've shown an embedding info message for
+        self._reported_embedding_info_t = set()
 
         # remember last directory where embeddings were saved/loaded
         self._last_embeddings_dir = None
@@ -404,6 +399,98 @@ class MicroSAM4DAnnotator(Annotator3d):
 
             btn_current.clicked.connect(lambda _: _compute_current())
             btn_all.clicked.connect(lambda _: _compute_all())
+
+            # Add save and load embeddings buttons
+            save_load_row = QtWidgets.QWidget()
+            save_load_layout = QtWidgets.QHBoxLayout()
+            save_load_row.setLayout(save_load_layout)
+            btn_save = QtWidgets.QPushButton("Save embeddings")
+            btn_load = QtWidgets.QPushButton("Load embeddings from directory")
+            save_load_layout.addWidget(btn_save)
+            save_load_layout.addWidget(btn_load)
+            emb_layout.addWidget(save_load_row)
+
+            def _save_embeddings():
+                try:
+                    # Select directory to save embeddings
+                    directory = QFileDialog.getExistingDirectory(
+                        None, 
+                        "Select Directory to Save Embeddings",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    show_info(f"Computing and saving embeddings for all timesteps to {directory} — this may take a long time.")
+                    
+                    # Compute embeddings for all timesteps and save them
+                    save_path = Path(directory)
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    
+                    for t in range(self.n_timesteps):
+                        filename = save_path / f"t{t}.zarr"
+                        show_info(f"Computing embeddings for timestep {t}...")
+                        self.compute_embeddings_for_timestep(
+                            t=t, 
+                            save_path=str(filename)
+                        )
+                    
+                    # Store the directory path for future reference
+                    self._last_embeddings_dir = str(save_path)
+                    show_info(f"All embeddings saved to {directory}")
+                    
+                except Exception as e:
+                    print(f"Failed to save embeddings: {e}")
+                    show_info(f"Failed to save embeddings: {e}")
+
+            def _load_embeddings():
+                try:
+                    # Select directory containing embeddings
+                    directory = QFileDialog.getExistingDirectory(
+                        None,
+                        "Select Directory Containing Embeddings",
+                        str(Path.home())
+                    )
+                    if not directory:
+                        return
+                    
+                    directory_path = Path(directory)
+                    
+                    # Check for t0, t1, t2, ... files
+                    embedding_files = sorted(directory_path.glob("t*.zarr"))
+                    if not embedding_files:
+                        show_info(f"No embedding files (t0.zarr, t1.zarr, ...) found in {directory}")
+                        return
+                    
+                    # Store lazy loading information
+                    self._last_embeddings_dir = str(directory_path)
+                    
+                    # Initialize embeddings_4d with lazy entries (just store paths)
+                    if not hasattr(self, "embeddings_4d") or self.embeddings_4d is None:
+                        self.embeddings_4d = {}
+                    
+                    # Only load embeddings for timesteps that exist in the viewer
+                    loaded_count = 0
+                    for t in range(min(self.n_timesteps, len(embedding_files))):
+                        filename = directory_path / f"t{t}.zarr"
+                        if filename.exists():
+                            # Store path for lazy loading
+                            self.embeddings_4d[t] = {"path": str(filename)}
+                            loaded_count += 1
+                    
+                    # Load embeddings for current timestep immediately
+                    current_t = getattr(self, "current_timestep", 0)
+                    if current_t in self.embeddings_4d:
+                        self._load_embedding_for_timestep(current_t)
+                    
+                    show_info(f"Embeddings loaded for {loaded_count} timesteps")
+                    
+                except Exception as e:
+                    print(f"Failed to load embeddings: {e}")
+                    show_info(f"Failed to load embeddings: {e}")
+
+            btn_save.clicked.connect(lambda _: _save_embeddings())
+            btn_load.clicked.connect(lambda _: _load_embeddings())
 
             # Removed save/load embeddings folder functions and handlers
 
@@ -638,6 +725,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                 try:
                     canvas = self._viewer.window.qt_viewer.canvas.native
                     
+                    def on_mouse_enter(event):
+                        """Set crosshair cursor when entering viewer in add mode"""
+                        try:
+                            if layer.mode == 'add':
+                                canvas.setCursor(Qt.CrossCursor)
+                        except Exception:
+                            pass
+                    
                     def on_mouse_leave(event):
                         """Reset cursor to normal when leaving the viewer"""
                         try:
@@ -645,8 +740,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                         except Exception:
                             pass
                     
-                    # Connect to canvas leave event
+                    # Connect to canvas enter/leave events
                     try:
+                        original_enter = canvas.enterEvent
+                        canvas.enterEvent = lambda event: (on_mouse_enter(event), original_enter(event) if callable(original_enter) else None)
                         canvas.leaveEvent = lambda event: on_mouse_leave(event)
                     except Exception:
                         pass
@@ -1178,6 +1275,69 @@ class MicroSAM4DAnnotator(Annotator3d):
             raise RuntimeError("No last embeddings directory is set. Call set_embeddings_folder(path) first.")
         return self.set_embeddings_folder(self._last_embeddings_dir, lazy=lazy)
 
+    def _load_embedding_for_timestep(self, t: int):
+        """Load embeddings for a specific timestep from disk (lazy loading helper).
+        
+        This method is called when switching to a timestep that has a lazy embedding entry.
+        It loads the embedding from disk and activates it in AnnotatorState.
+        """
+        try:
+            if not hasattr(self, "embeddings_4d") or self.embeddings_4d is None:
+                return
+            
+            entry = self.embeddings_4d.get(t)
+            if entry is None:
+                return
+            
+            # If entry only has a path, load it from disk
+            if isinstance(entry, dict) and "path" in entry and "features" not in entry:
+                import zarr as _zarr
+                # _select_array_from_zarr_group is defined at the top of this file
+                
+                path = Path(entry["path"])
+                if not path.exists():
+                    print(f"Warning: Embedding file not found: {path}")
+                    return
+                
+                # Load the zarr file
+                f = _zarr.open(str(path), mode="r")
+                feats = _select_array_from_zarr_group(f)
+                
+                if feats is None:
+                    print(f"Warning: No features found in {path}")
+                    return
+                
+                # Get metadata from array attrs and root group attrs; fall back to image shape
+                arr_attrs = dict(getattr(feats, "attrs", {}) or {})
+                root_attrs = dict(getattr(f, "attrs", {}) or {})
+                input_size = arr_attrs.get("input_size") or root_attrs.get("input_size")
+                original_size = arr_attrs.get("original_size") or root_attrs.get("original_size")
+
+                # Final fallback: use the current image shape (Y, X) rather than feature shape
+                if original_size is None:
+                    try:
+                        img_shape_yx = tuple(self.image_4d[int(t)].shape[-2:])
+                        original_size = img_shape_yx
+                    except Exception:
+                        # As a last resort do not guess from feats (would be 64x64 and wrong)
+                        original_size = None
+                if input_size is None:
+                    input_size = original_size
+                
+                # Update the entry with loaded features
+                self.embeddings_4d[t] = {
+                    "features": feats,
+                    "input_size": input_size,
+                    "original_size": original_size,
+                    "path": str(path)
+                }
+            
+            # Now activate the embeddings for this timestep
+            self._ensure_embeddings_active_for_t(t)
+            
+        except Exception as e:
+            print(f"Failed to load embedding for timestep {t}: {e}")
+
     def _materialize_embedding_entry(self, entry):
         """Best-effort materialize a saved embedding entry.
 
@@ -1220,7 +1380,7 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception:
             pass
 
-        # If it's a zarr store, open it and return the 'features' object with synthesized metadata
+            # If it's a zarr store, open it and return the 'features' object with synthesized metadata
         try:
             if p.suffix == ".zarr" or (p.exists() and p.is_dir() and any(p.glob("*.zarr"))):
                 import zarr as _zarr
@@ -1243,17 +1403,19 @@ class MicroSAM4DAnnotator(Annotator3d):
                         except Exception:
                             pass
                         return None
-                    attrs = getattr(feats, "attrs", {}) or {}
-                    input_size = attrs.get("input_size")
-                    original_size = attrs.get("original_size")
-                    if input_size is None and ("shape" not in attrs and "tile_shape" not in attrs):
+                    arr_attrs = dict(getattr(feats, "attrs", {}) or {})
+                    root_attrs = dict(getattr(f, "attrs", {}) or {})
+                    input_size = arr_attrs.get("input_size") or root_attrs.get("input_size")
+                    original_size = arr_attrs.get("original_size") or root_attrs.get("original_size")
+                    if original_size is None:
                         try:
-                            inferred = (int(feats.shape[-2]), int(feats.shape[-1]))
-                            input_size = input_size or inferred
-                            original_size = original_size or inferred
+                            # Use annotator image shape if available
+                            # Note: we cannot know 't' here reliably; leave None and let activation fill in
+                            original_size = None
                         except Exception:
-                            input_size = input_size or None
-                            original_size = original_size or None
+                            original_size = None
+                    if input_size is None:
+                        input_size = original_size
                     return {"features": feats, "input_size": input_size, "original_size": original_size}
         except Exception:
             pass
@@ -1325,10 +1487,6 @@ class MicroSAM4DAnnotator(Annotator3d):
 
                 # Mark as loading and spawn background thread
                 self._embedding_loading[int(t)] = True
-                try:
-                    show_info(f"Materializing embeddings for timestep {t} in background...")
-                except Exception:
-                    pass
 
                 def _bg():
                     try:
@@ -1347,10 +1505,6 @@ class MicroSAM4DAnnotator(Annotator3d):
                             try:
                                 # call activation synchronously now that mat exists
                                 self._ensure_embeddings_active_for_t(t)
-                            except Exception:
-                                pass
-                            try:
-                                show_info(f"Embeddings for timestep {t} are ready.")
                             except Exception:
                                 pass
                         else:
@@ -1381,6 +1535,13 @@ class MicroSAM4DAnnotator(Annotator3d):
                 # If the entry is already materialized and contains features, use it as save_path
                 save_path = None
                 if isinstance(entry, dict) and "features" in entry:
+                    # Ensure minimal metadata is present; do not reject on mismatch
+                    if image3d is not None:
+                        expected_shape = tuple(image3d.shape[-2:])
+                        if entry.get("original_size") is None:
+                            entry["original_size"] = expected_shape
+                        if entry.get("input_size") is None:
+                            entry["input_size"] = entry.get("original_size")
                     save_path = entry
                 elif isinstance(entry, dict) and entry.get("path"):
                     save_path = str(entry.get("path"))
@@ -1478,6 +1639,36 @@ class MicroSAM4DAnnotator(Annotator3d):
                                 pass
                 except Exception:
                     pass
+
+                # Show a concise one-time info about active embeddings for this timestep
+                try:
+                    if int(t) not in getattr(self, "_reported_embedding_info_t", set()):
+                        orig = None
+                        tiled = False
+                        src_name = "memory"
+                        try:
+                            if isinstance(entry, dict):
+                                orig = entry.get("original_size")
+                                feats = entry.get("features")
+                                if feats is not None and hasattr(feats, "attrs"):
+                                    tiled = feats.attrs.get("tile_shape") is not None
+                                pth = entry.get("path")
+                                if pth:
+                                    src_name = Path(pth).name
+                            elif isinstance(entry, str):
+                                src_name = Path(entry).name
+                        except Exception:
+                            pass
+                        try:
+                            show_info(f"Embeddings t{t} active • size={orig if orig is not None else 'unknown'} • tiled={bool(tiled)} • source={src_name}")
+                        except Exception:
+                            pass
+                        try:
+                            self._reported_embedding_info_t.add(int(t))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             except Exception:
                 pass
         except Exception:
@@ -1559,6 +1750,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                 try:
                     canvas = self._viewer.window.qt_viewer.canvas.native
                     
+                    def on_mouse_enter(event):
+                        """Set crosshair cursor when entering viewer in add mode"""
+                        try:
+                            if layer.mode == 'add':
+                                canvas.setCursor(Qt.CrossCursor)
+                        except Exception:
+                            pass
+                    
                     def on_mouse_leave(event):
                         """Reset cursor to normal when leaving the viewer"""
                         try:
@@ -1566,8 +1765,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                         except Exception:
                             pass
                     
-                    # Connect to canvas leave event
+                    # Connect to canvas enter/leave events
                     try:
+                        original_enter = canvas.enterEvent
+                        canvas.enterEvent = lambda event: (on_mouse_enter(event), original_enter(event) if callable(original_enter) else None)
                         canvas.leaveEvent = lambda event: on_mouse_leave(event)
                     except Exception:
                         pass
@@ -1998,6 +2199,111 @@ class MicroSAM4DAnnotator(Annotator3d):
         except Exception as e:
             print(f"Failed to clear remap points: {e}")
 
+    def debug_segmentation_4d(self, t: int) -> bool:
+        """Debug segmentation setup for a specific timestep.
+        
+        Returns True if segmentation can proceed, False if fatal error found.
+        """
+        print(f"\n🔍 Debugging timestep {t}")
+        fatal_error = False
+        
+        # 1. Check embeddings exist
+        if not hasattr(self, "embeddings_4d") or self.embeddings_4d is None:
+            print(f"❌ embeddings_4d attribute missing")
+            return False
+        
+        entry = self.embeddings_4d.get(int(t))
+        if entry is None:
+            print(f"❌ No embeddings for timestep {t}")
+            return False
+        else:
+            # Check if embeddings are loaded (have features)
+            if isinstance(entry, dict) and "features" in entry:
+                print(f"✔ Embeddings found (materialized)")
+            elif isinstance(entry, dict) and "path" in entry:
+                print(f"✔ Embeddings found (lazy, path: {entry['path']})")
+            else:
+                print(f"⚠ Embeddings found but in unexpected format: {type(entry)}")
+        
+        # Check AnnotatorState has embeddings activated
+        try:
+            from ._state import AnnotatorState
+            state = AnnotatorState()
+            if state.image_embeddings is None:
+                print(f"❌ Embeddings not activated in AnnotatorState")
+                return False
+            else:
+                print(f"✔ Embeddings activated in AnnotatorState")
+                
+            # Check predictor exists
+            if state.predictor is None:
+                print(f"❌ No predictor in AnnotatorState")
+                return False
+            else:
+                print(f"✔ Predictor exists")
+        except Exception as e:
+            print(f"❌ Failed to check AnnotatorState: {e}")
+            return False
+        
+        # 2. Check point prompts exist
+        if not hasattr(self, "point_prompts_4d"):
+            print(f"❌ point_prompts_4d attribute missing")
+            return False
+        
+        pts = self.point_prompts_4d.get(int(t))
+        if pts is None or (hasattr(pts, 'size') and pts.size == 0):
+            print(f"❌ No point prompts in timestep {t}")
+            return False
+        else:
+            print(f"✔ Point prompts found: {len(pts)} points")
+            # Show first few points
+            if len(pts) > 0:
+                print(f"  First point: {pts[0]}")
+        
+        # 4. Check image dimensions
+        if self.image_4d is None:
+            print(f"❌ image_4d is None")
+            return False
+        
+        try:
+            image3d = self.image_4d[int(t)]
+            shape = image3d.shape
+            
+            if len(shape) == 3:
+                print(f"✔ Image dimensions OK: {shape} (Z, Y, X)")
+            elif len(shape) == 2:
+                print(f"⚠ Image is 2D: {shape} (Y, X) - may need 2D segmentation")
+            elif len(shape) == 4:
+                print(f"❌ Image has wrong dimensions: {shape} (should be 3D, got 4D)")
+                return False
+            else:
+                print(f"❌ Unexpected image dimensions: {shape}")
+                return False
+                
+            # Check image is not empty
+            if image3d.size == 0:
+                print(f"❌ Image is empty")
+                return False
+                
+            # Check image has reasonable values
+            img_min, img_max = image3d.min(), image3d.max()
+            print(f"  Image value range: [{img_min}, {img_max}]")
+            if img_min == img_max:
+                print(f"⚠ Image has constant value - may produce poor segmentation")
+                
+        except Exception as e:
+            print(f"❌ Failed to check image: {e}")
+            return False
+        
+        # 5. Check current_object_4d exists
+        if self.current_object_4d is None:
+            print(f"⚠ current_object_4d is None (will be created)")
+        else:
+            print(f"✔ current_object_4d exists with shape {self.current_object_4d.shape}")
+        
+        print(f"✅ All checks passed - ready for segmentation\n")
+        return True
+
     def segment_all_timesteps(self):
         """Run manual segmentation for all timesteps that have point prompts.
 
@@ -2047,21 +2353,59 @@ class MicroSAM4DAnnotator(Annotator3d):
             pts = prompt_map.get(t, np.empty((0, 3)))
             pts_arr = np.asarray(pts) if pts is not None else np.empty((0, 3))
             if pts_arr.size == 0:
+                print(f"⏭️  Skipping timestep {t} - no point prompts")
                 continue
 
             # Update current timestep internally without triggering full UI updates
             self.current_timestep = int(t)
 
+            # Run debug checks before attempting segmentation
+            if not self.debug_segmentation_4d(t):
+                print(f"⏭️  Skipping timestep {t} due to failed checks\n")
+                continue
+
             # Activate embeddings/predictor for this timestep
+            # For batch segmentation, we need to ensure embeddings are fully loaded (not async)
             try:
+                # Check if we have a lazy entry that needs loading
+                entry = self.embeddings_4d.get(int(t)) if hasattr(self, "embeddings_4d") else None
+                if entry is not None and isinstance(entry, dict) and "path" in entry and "features" not in entry:
+                    # Load synchronously during batch processing
+                    try:
+                        self._load_embedding_for_timestep(int(t))
+                        # Give a moment for the embedding to be activated
+                        import time
+                        time.sleep(0.1)
+                    except Exception as e:
+                        print(f"Failed to load embeddings for timestep {t}: {e}")
+                        continue
+                
+                # Now ensure embeddings are active
                 if getattr(self, "timestep_embedding_manager", None) is not None:
                     try:
                         self.timestep_embedding_manager.on_timestep_changed(int(t))
                     except Exception:
                         pass
                 self._ensure_embeddings_active_for_t(int(t))
-            except Exception:
-                pass
+                
+                # Verify embeddings are actually loaded in AnnotatorState
+                from ._state import AnnotatorState
+                state = AnnotatorState()
+                if state.image_embeddings is None:
+                    print(f"Warning: Embeddings not activated for timestep {t}, skipping")
+                    continue
+                    
+                # Ensure image metadata is set for segmentation
+                if state.image_shape is None:
+                    try:
+                        image3d = self.image_4d[int(t)]
+                        state.image_shape = tuple(image3d.shape)
+                    except Exception:
+                        pass
+                        
+            except Exception as e:
+                print(f"Failed to activate embeddings for timestep {t}: {e}")
+                continue
 
             # Manually set point prompts for this timestep without triggering callbacks
             try:
@@ -2077,6 +2421,14 @@ class MicroSAM4DAnnotator(Annotator3d):
                     try:
                         canvas = self._viewer.window.qt_viewer.canvas.native
                         
+                        def on_mouse_enter(event):
+                            """Set crosshair cursor when entering viewer in add mode"""
+                            try:
+                                if point_layer.mode == 'add':
+                                    canvas.setCursor(Qt.CrossCursor)
+                            except Exception:
+                                pass
+                        
                         def on_mouse_leave(event):
                             """Reset cursor to normal when leaving the viewer"""
                             try:
@@ -2084,8 +2436,10 @@ class MicroSAM4DAnnotator(Annotator3d):
                             except Exception:
                                 pass
                         
-                        # Connect to canvas leave event
+                        # Connect to canvas enter/leave events
                         try:
+                            original_enter = canvas.enterEvent
+                            canvas.enterEvent = lambda event: (on_mouse_enter(event), original_enter(event) if callable(original_enter) else None)
                             canvas.leaveEvent = lambda event: on_mouse_leave(event)
                         except Exception:
                             pass
@@ -2096,59 +2450,123 @@ class MicroSAM4DAnnotator(Annotator3d):
 
             # Run manual volumetric segmentation
             try:
-                if hasattr(self, "segment_current_timestep"):
-                    self.segment_current_timestep()
-                elif hasattr(self, "segment_slices"):
-                    self.segment_slices()
-                elif seg_widget is not None:
-                    seg_widget.__call__()
-                else:
-                    from micro_sam.sam_annotator import _widgets as _w
-                    _w.segment_slice(self._viewer)
-            except Exception:
-                # Skip this timestep on failure
-                continue
-
-            # Store the 3D result into current_object_4d[t]
-            vol3d = None
-            try:
-                if "current_object_4d" in self._viewer.layers:
-                    vol3d = np.asarray(self._viewer.layers["current_object_4d"].data[int(t)])
-                elif "current_object" in self._viewer.layers:
-                    vol3d = np.asarray(self._viewer.layers["current_object"].data)
-            except Exception:
-                vol3d = None
-
-            if vol3d is None:
-                continue
-
-            # Ensure correct dtype/shape
-            try:
-                target_shape = self.current_object_4d[int(t)].shape
-                if getattr(vol3d, "shape", None) != target_shape:
-                    vol3d = _sk_resize(
-                        vol3d.astype("float32"), target_shape, order=0, preserve_range=True, anti_aliasing=False
-                    ).astype(np.uint32)
-                else:
-                    vol3d = vol3d.astype(np.uint32, copy=False)
-            except Exception:
-                pass
-
-            try:
-                self.current_object_4d[int(t)] = vol3d
-                lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
-                if lay is not None:
-                    if hasattr(lay, "events") and hasattr(lay.events, "data"):
-                        with lay.events.data.blocker():
-                            lay.data[int(t)] = vol3d
+                print(f"Attempting segmentation for timestep {t} with {len(pts_arr)} point prompts")
+                
+                # Use the prompt_segmentation utility directly for 3D segmentation
+                from . import util as sam_util
+                
+                # Get the 3D image for this timestep
+                image3d = self.image_4d[int(t)]
+                
+                # Convert point prompts to the format expected by prompt_segmentation
+                if len(pts_arr) > 0:
+                    # Point prompts are in (Z, Y, X) format
+                    points = pts_arr[:, :3]  # Z, Y, X coordinates
+                    labels = np.ones(len(points), dtype=int)  # All positive prompts by default
+                    
+                    # Get the shape for segmentation (Z, Y, X)
+                    shape = image3d.shape
+                    
+                    # For 3D segmentation, we need to segment from the slice containing the point
+                    # Get the Z coordinate of the first point
+                    z_slice = int(points[0, 0])
+                    
+                    # Get 2D points (Y, X) for this slice
+                    points_2d = points[:, 1:3]  # Just Y, X
+                    shape_2d = shape[1:]  # Just Y, X shape
+                    
+                    # Perform 2D segmentation on the initial slice
+                    from ._state import AnnotatorState
+                    state = AnnotatorState()
+                    
+                    print(f"  Segmenting slice {z_slice} with points at {points_2d}")
+                    
+                    # Segment the initial slice using 2D segmentation
+                    seg_2d = sam_util.prompt_segmentation(
+                        state.predictor,
+                        points_2d,
+                        labels,
+                        boxes=np.array([]),
+                        masks=None,
+                        shape=shape_2d,
+                        multiple_box_prompts=False,
+                        image_embeddings=state.image_embeddings,
+                        i=z_slice,  # Specify the slice index for 3D embeddings
+                    )
+                    
+                    if seg_2d is not None and seg_2d.max() > 0:
+                        print(f"  Initial 2D segmentation successful, extending to 3D volume")
+                        
+                        # Create 3D segmentation array
+                        seg = np.zeros(shape, dtype=np.uint32)
+                        seg[z_slice] = seg_2d
+                        
+                        # Now extend the segmentation to neighboring slices using segment_mask_in_volume
+                        from micro_sam.multi_dimensional_segmentation import segment_mask_in_volume
+                        
+                        segmented_slices = np.array([z_slice])
+                        
+                        try:
+                            seg, (z_min, z_max) = segment_mask_in_volume(
+                                seg,
+                                state.predictor,
+                                state.image_embeddings,
+                                segmented_slices,
+                                stop_lower=False,
+                                stop_upper=False,
+                                iou_threshold=0.5,
+                                projection="mask",
+                                verbose=False,
+                            )
+                            print(f"  Extended segmentation from slice {z_min} to {z_max}")
+                        except Exception as e:
+                            print(f"  Note: Could not extend to full volume (using single slice only): {e}")
+                            # Keep the single slice segmentation
                     else:
-                        lay.data[int(t)] = vol3d
-                    try:
-                        lay.refresh()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                        seg = None
+                    
+                    if seg is not None:
+                        print(f"Segmentation successful for timestep {t}, shape: {seg.shape}")
+                        
+                        # 6. Check if SAM returned empty mask
+                        mask_max = seg.max()
+                        mask_min = seg.min()
+                        mask_nonzero = np.count_nonzero(seg)
+                        
+                        print(f"  Mask stats: min={mask_min}, max={mask_max}, nonzero_pixels={mask_nonzero}")
+                        
+                        if mask_max == 0:
+                            print(f"❌ SAM produced empty mask for timestep {t}")
+                            print(f"  Possible causes:")
+                            print(f"    - Point prompts are outside image bounds")
+                            print(f"    - Wrong embeddings loaded (mismatch with image)")
+                            print(f"    - Image has very low contrast")
+                            print(f"    - Predictor not properly initialized")
+                            continue
+                        
+                        # Store directly into current_object_4d and update the layer
+                        self.current_object_4d[int(t)] = seg.astype(np.uint32)
+                        
+                        # Update the napari layer
+                        try:
+                            lay = self._viewer.layers["current_object_4d"] if "current_object_4d" in self._viewer.layers else None
+                            if lay is not None:
+                                lay.refresh()
+                                print(f"✅ Segmentation stored and layer refreshed for timestep {t}")
+                            else:
+                                print(f"⚠ current_object_4d layer not found in viewer")
+                        except Exception as e:
+                            print(f"Failed to refresh layer: {e}")
+                    else:
+                        print(f"Segmentation returned None for timestep {t}")
+                else:
+                    print(f"No point prompts for timestep {t}, skipping")
+                    
+            except Exception as e:
+                print(f"Segmentation failed for timestep {t}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
 
         # Restore original timestep and its point prompts
         try:

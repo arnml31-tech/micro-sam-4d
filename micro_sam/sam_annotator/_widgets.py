@@ -1174,6 +1174,14 @@ def segment_slice(viewer: "napari.viewer.Viewer") -> None:
 
     annotator = AnnotatorState().annotator
     curr = annotator.get_layer_data("current_object")
+    # Safety: if the segmentation shape does not match the target slice, resize (nearest)
+    try:
+        target_shape = curr[z].shape
+        if getattr(seg, "shape", None) != target_shape:
+            from skimage.transform import resize as _sk_resize
+            seg = _sk_resize(seg.astype("float32"), target_shape, order=0, preserve_range=True, anti_aliasing=False).astype(seg.dtype)
+    except Exception:
+        pass
     curr[z] = seg
     annotator.set_layer_data("current_object", curr)
 
